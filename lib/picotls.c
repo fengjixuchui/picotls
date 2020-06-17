@@ -286,6 +286,7 @@ struct st_ptls_client_hello_psk_t {
 #define MAX_CLIENT_CIPHERS 32
 
 struct st_ptls_client_hello_t {
+    uint16_t legacy_version;
     const uint8_t *random_bytes;
     ptls_iovec_t legacy_session_id;
     struct {
@@ -331,7 +332,8 @@ struct st_ptls_client_hello_t {
             size_t count;
         } identities;
         unsigned ke_modes;
-        int early_data_indication;
+        unsigned early_data_indication : 1;
+        unsigned is_last_extension : 1;
     } psk;
     ptls_raw_extension_t unknown_extensions[MAX_UNKNOWN_EXTENSIONS + 1];
     unsigned status_request : 1;
@@ -3144,14 +3146,12 @@ static int decode_client_hello(ptls_t *tls, struct st_ptls_client_hello_t *ch, c
     uint16_t exttype = 0;
     int ret;
 
-    { /* check protocol version */
-        uint16_t protver;
-        if ((ret = ptls_decode16(&protver, &src, end)) != 0)
-            goto Exit;
-        if (protver != 0x0303) {
-            ret = PTLS_ALERT_HANDSHAKE_FAILURE;
-            goto Exit;
-        }
+    /* decode protocol version (do not bare to decode something older than TLS 1.0) */
+    if ((ret = ptls_decode16(&ch->legacy_version, &src, end)) != 0)
+        goto Exit;
+    if (ch->legacy_version < 0x0301) {
+        ret = PTLS_ALERT_PROTOCOL_VERSION;
+        goto Exit;
     }
 
     /* skip random */
@@ -3201,6 +3201,7 @@ static int decode_client_hello(ptls_t *tls, struct st_ptls_client_hello_t *ch, c
 
     /* decode extensions */
     decode_extensions(src, end, PTLS_HANDSHAKE_TYPE_CLIENT_HELLO, &exttype, {
+        ch->psk.is_last_extension = 0;
         if (tls->ctx->on_extension != NULL &&
             (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_CLIENT_HELLO, exttype,
                                               ptls_iovec_init(src, end - src)) != 0))
@@ -3379,6 +3380,7 @@ static int decode_client_hello(ptls_t *tls, struct st_ptls_client_hello_t *ch, c
                     goto Exit;
                 }
             });
+            ch->psk.is_last_extension = 1;
         } break;
         case PTLS_EXTENSION_TYPE_PSK_KEY_EXCHANGE_MODES:
             ptls_decode_block(src, end, 1, {
@@ -3404,37 +3406,6 @@ static int decode_client_hello(ptls_t *tls, struct st_ptls_client_hello_t *ch, c
         }
         src = end;
     });
-
-    /* check if client hello make sense */
-    if (is_supported_version(ch->selected_version)) {
-        if (!(ch->compression_methods.count == 1 && ch->compression_methods.ids[0] == 0)) {
-            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-            goto Exit;
-        }
-        /* esni */
-        if (ch->esni.cipher != NULL) {
-            if (ch->key_shares.base == NULL) {
-                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-                goto Exit;
-            }
-        }
-        /* pre-shared key */
-        if (ch->psk.hash_end != NULL) {
-            /* PSK must be the last extension */
-            if (exttype != PTLS_EXTENSION_TYPE_PRE_SHARED_KEY) {
-                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-                goto Exit;
-            }
-        } else {
-            if (ch->psk.early_data_indication) {
-                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-                goto Exit;
-            }
-        }
-    } else {
-        ret = PTLS_ALERT_PROTOCOL_VERSION;
-        goto Exit;
-    }
 
     ret = 0;
 Exit:
@@ -3633,7 +3604,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                               additional_extensions                                                                                \
                           } while (0);                                                                                             \
                       })
-    struct st_ptls_client_hello_t ch = {NULL,   {NULL}, {NULL},     0,     {NULL}, {NULL},   {NULL}, {{0}},
+    struct st_ptls_client_hello_t ch = {0, NULL,   {NULL}, {NULL},     0,     {NULL}, {NULL},   {NULL}, {{0}},
                                         {NULL}, {NULL}, {{{NULL}}}, {{0}}, {{0}},  {{NULL}}, {NULL}, {{UINT16_MAX}}};
     struct {
         ptls_key_exchange_algorithm_t *algorithm;
@@ -3648,6 +3619,56 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
     if ((ret = decode_client_hello(tls, &ch, message.base + PTLS_HANDSHAKE_HEADER_SIZE, message.base + message.len, properties)) !=
         0)
         goto Exit;
+
+    /* bail out if CH cannot be handled as TLS 1.3, providing the application the raw CH and SNI, to help them fallback */
+    if (!is_supported_version(ch.selected_version)) {
+        if (!is_second_flight && tls->ctx->on_client_hello != NULL) {
+            ptls_on_client_hello_parameters_t params = {
+                .server_name = ch.server_name,
+                .raw_message = message,
+                .negotiated_protocols = {ch.alpn.list, ch.alpn.count},
+                .incompatible_version = 1,
+            };
+            if ((ret = tls->ctx->on_client_hello->cb(tls->ctx->on_client_hello, tls, &params)) != 0)
+                goto Exit;
+        }
+        ret = PTLS_ALERT_PROTOCOL_VERSION;
+        goto Exit;
+    }
+
+    /* Check TLS 1.3-specific constraints. Hereafter, we might exit without calling on_client_hello. That's fine because this CH is
+     * ought to be rejected. */
+    if (ch.legacy_version <= 0x0300) {
+        /* RFC 8446 Appendix D.5: any endpoint receiving a Hello message with legacy_version set to 0x0300 MUST abort the handshake
+         * with a "protocol_version" alert. */
+        ret = PTLS_ALERT_PROTOCOL_VERSION;
+        goto Exit;
+    }
+    if (!(ch.compression_methods.count == 1 && ch.compression_methods.ids[0] == 0)) {
+        ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+        goto Exit;
+    }
+    /* esni */
+    if (ch.esni.cipher != NULL) {
+        if (ch.key_shares.base == NULL) {
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
+    }
+    /* pre-shared key */
+    if (ch.psk.hash_end != NULL) {
+        /* PSK must be the last extension */
+        if (!ch.psk.is_last_extension) {
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
+    } else {
+        if (ch.psk.early_data_indication) {
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
+    }
+
     if (tls->ctx->require_dhe_on_psk)
         ch.psk.ke_modes &= ~(1u << PTLS_PSK_KE_MODE_PSK);
 
@@ -5096,28 +5117,18 @@ void ptls_cipher_free(ptls_cipher_context_t *ctx)
 ptls_aead_context_t *new_aead(ptls_aead_algorithm_t *aead, ptls_hash_algorithm_t *hash, int is_enc, const void *secret,
                               ptls_iovec_t hash_value, const char *label_prefix)
 {
-    ptls_aead_context_t *ctx;
-    uint8_t key[PTLS_MAX_SECRET_SIZE];
+    ptls_aead_context_t *ctx = NULL;
+    uint8_t key_iv[aead->key_size + aead->iv_size];
     int ret;
 
-    if ((ctx = (ptls_aead_context_t *)malloc(aead->context_size)) == NULL)
-        return NULL;
-
-    *ctx = (ptls_aead_context_t){aead};
-    if ((ret = get_traffic_key(hash, key, aead->key_size, 0, secret, hash_value, label_prefix)) != 0)
+    if ((ret = get_traffic_key(hash, key_iv, aead->key_size, 0, secret, hash_value, label_prefix)) != 0)
         goto Exit;
-    if ((ret = get_traffic_key(hash, ctx->static_iv, aead->iv_size, 1, secret, hash_value, label_prefix)) != 0)
+    if ((ret = get_traffic_key(hash, key_iv + aead->key_size, aead->iv_size, 1, secret, hash_value, label_prefix)) != 0)
         goto Exit;
-    ret = aead->setup_crypto(ctx, is_enc, key);
+    ctx = ptls_aead_new_direct(aead, is_enc, key_iv, key_iv + aead->key_size);
 
 Exit:
-    ptls_clear_memory(key, aead->key_size);
-    if (ret != 0) {
-        ptls_clear_memory(ctx->static_iv, aead->iv_size);
-        free(ctx);
-        ctx = NULL;
-    }
-
+    ptls_clear_memory(key_iv, sizeof(key_iv));
     return ctx;
 }
 
@@ -5127,29 +5138,33 @@ ptls_aead_context_t *ptls_aead_new(ptls_aead_algorithm_t *aead, ptls_hash_algori
     return new_aead(aead, hash, is_enc, secret, ptls_iovec_init(NULL, 0), label_prefix);
 }
 
+ptls_aead_context_t *ptls_aead_new_direct(ptls_aead_algorithm_t *aead, int is_enc, const void *key, const void *iv)
+{
+    ptls_aead_context_t *ctx;
+
+    if ((ctx = (ptls_aead_context_t *)malloc(aead->context_size)) == NULL)
+        return NULL;
+
+    *ctx = (ptls_aead_context_t){aead};
+
+    if (aead->setup_crypto(ctx, is_enc, key, iv) != 0) {
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
 void ptls_aead_free(ptls_aead_context_t *ctx)
 {
     ctx->dispose_crypto(ctx);
-    ptls_clear_memory(ctx->static_iv, ctx->algo->iv_size);
     free(ctx);
 }
 
-size_t ptls_aead_encrypt(ptls_aead_context_t *ctx, void *output, const void *input, size_t inlen, uint64_t seq, const void *aad,
-                         size_t aadlen)
+void ptls_aead__build_iv(ptls_aead_algorithm_t *algo, uint8_t *iv, const uint8_t *static_iv, uint64_t seq)
 {
-    size_t off = 0;
-
-    ptls_aead_encrypt_init(ctx, seq, aad, aadlen);
-    off += ptls_aead_encrypt_update(ctx, ((uint8_t *)output) + off, input, inlen);
-    off += ptls_aead_encrypt_final(ctx, ((uint8_t *)output) + off);
-
-    return off;
-}
-
-void ptls_aead__build_iv(ptls_aead_context_t *ctx, uint8_t *iv, uint64_t seq)
-{
-    size_t iv_size = ctx->algo->iv_size, i;
-    const uint8_t *s = ctx->static_iv;
+    size_t iv_size = algo->iv_size, i;
+    const uint8_t *s = static_iv;
     uint8_t *d = iv;
 
     /* build iv */
