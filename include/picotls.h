@@ -52,7 +52,7 @@ extern "C" {
  * best coverage. This macro is for preventing misuse going into the master branch, having it work one of the compilers supported in
  * our CI is enough.
  */
-#if (defined(__clang__) && __clang_major__ >= 10) || __GNUC__ >= 6
+#if ((defined(__clang__) && __clang_major__ >= 10) || __GNUC__ >= 6) && !defined(__cplusplus)
 #define PTLS_ASSERT_IS_ARRAY_EXPR(a) PTLS_BUILD_ASSERT_EXPR(__builtin_types_compatible_p(__typeof__(a[0])[], __typeof__(a)))
 #else
 #define PTLS_ASSERT_IS_ARRAY_EXPR(a) 1
@@ -78,11 +78,17 @@ extern "C" {
 #define PTLS_AES_IV_SIZE 16
 #define PTLS_AESGCM_IV_SIZE 12
 #define PTLS_AESGCM_TAG_SIZE 16
+#define PTLS_AESGCM_CONFIDENTIALITY_LIMIT 0x2000000            /* 2^25 */
+#define PTLS_AESGCM_INTEGRITY_LIMIT UINT64_C(0x40000000000000) /* 2^54 */
+#define PTLS_AESCCM_CONFIDENTIALITY_LIMIT 0xB504F3             /* 2^23.5 */
+#define PTLS_AESCCM_INTEGRITY_LIMIT 0xB504F3                   /* 2^23.5 */
 
 #define PTLS_CHACHA20_KEY_SIZE 32
 #define PTLS_CHACHA20_IV_SIZE 16
 #define PTLS_CHACHA20POLY1305_IV_SIZE 12
 #define PTLS_CHACHA20POLY1305_TAG_SIZE 16
+#define PTLS_CHACHA20POLY1305_CONFIDENTIALITY_LIMIT UINT64_MAX       /* at least 2^64 */
+#define PTLS_CHACHA20POLY1305_INTEGRITY_LIMIT UINT64_C(0x1000000000) /* 2^36 */
 
 #define PTLS_BLOWFISH_KEY_SIZE 16
 #define PTLS_BLOWFISH_BLOCK_SIZE 8
@@ -335,6 +341,14 @@ typedef const struct st_ptls_aead_algorithm_t {
      * name (following the convention of `openssl ciphers -v ALL`)
      */
     const char *name;
+    /**
+     * confidentiality_limit (max records / packets sent before re-key)
+     */
+    const uint64_t confidentiality_limit;
+    /**
+     * integrity_limit (max decryption failure records / packets before re-key)
+     */
+    const uint64_t integrity_limit;
     /**
      * the underlying key stream
      */
@@ -828,7 +842,10 @@ typedef struct st_ptls_handshake_properties_t {
 #ifdef _WINDOWS
 #pragma warning(pop)
 #endif
-
+#ifdef _WINDOWS
+/* suppress warning C4293: >> shift count negative or too big */
+#pragma warning(disable : 4293)
+#endif
 /**
  * builds a new ptls_iovec_t instance using the supplied parameters
  */
